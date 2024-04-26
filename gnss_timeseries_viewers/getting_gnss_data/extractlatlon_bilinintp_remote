@@ -1,0 +1,1182 @@
+#!/bin/bash
+
+###############################################################################
+#                       EXTRACTLATLON_BILININTP_REMOTE                        #
+###############################################################################
+#
+# written 2019 by R. Dill
+# GFZ, Potsdam, Germany
+#
+# Description:
+# extract local time series (e.g. at a single station at longitude latitude) for specific netCDF
+# variables from netCDF files stored at ESMGFZ RAMADDA server. The script downloads the data of
+# four gridcells surrounding the station location and performs bilinear interpolation.
+#
+# Usage: to extract single station time series
+#          >bash extractlatlon_bilinintp_remote dataset frame startdate enddate latitude longitude [-m] [-v variable1 [variable2 ...]] [-o outfilename]
+#
+#        to extract multi station time series
+#          >bash extractlatlon_bilinintp_remote dataset frame startdate enddate -s stationlistfile [-c columnorder] [-m] [-v variable1 [variable2 ...]] [-o outfilename]
+#          arguments:
+#             dataset             one of NTAL, NTOL, HYDL, SLEL or 
+#                                        NTAL24h, NTOL24h, NTAL24h+NTOL24h or
+#                                        NTAL+NTOL, NTOL+SLEL, NTAL+NTOL+HYDL, NTAL+NTOL+HYDL+SLEL or all
+#             frame               CF or CM
+#             startdate           1st epoch (format: yyyy-mm-dd)
+#             enddate             last epoch (format: yyyy-mm-dd)
+#             latitude            latitude of station [degree]
+#             longitude           longitude of station [degree]
+#
+#          options:
+#             -s stationlistfile  filename of station coordinate list (no header, 2 or 3 columns: [stationname/id] longitude latitude)
+#             -c columnorder      "latlon" or "lonlat", columnorder in stationlistname file (default=latlon)
+#                                 "xyz" for cartesian coordinates [stationname/id] X Y Z
+#             -m                  use land/ocean maskfile to prevent interpolation over the coastline (0=land/1=ocean)
+#             -v list of vars     specify variables from netCDF files (default: duV duNS duEW)
+#             -o outfilename      specify path and file names for output(->outfilename.stationID.txt). Existing files will be overwritten, a not
+#                                 existing path will be created
+#                                 default is >extractlatlon<.
+#
+###############################################################################
+#                   please adjust the user settings                           #
+###############################################################################
+# NCO library path ------------------------------------------------------------
+# need command ncks (only for command line option -m)
+ncopath=''
+ncopath='/dsk/igsoftlocal/nco-4.7.6/bin/'
+
+# define ESMGFZ RAMADDA server ------------------------------------------------
+ramaddaserver="esmdata.gfz-potsdam.de"
+ramadda="http://${ramaddaserver}:8080/repository"
+masksource="${ramadda}/entry/get/Home/Elastic+Surface+Loading/Documents/lwmask_AOD_0.5.nc"
+
+# temporal scratch directory --------------------------------------------------
+tmpdir="tmp"
+
+###############################################################################
+#                             end of user settings                            #
+###############################################################################
+
+# Command line arguments ######################################################
+
+# provide help information
+if [ $# -eq 0 ] || [ X$1 = "X-h" ] 
+then
+  echo "Usage:"
+  echo ">extractlatlon_bilinintp_remote dataset frame startdate enddate latitude longitude [-m] [-v variable1 [variable2 ...]] [-o outfilename]"
+  echo "or"
+  echo ">extractlatlon_bilinintp_remote dataset frame startdate enddate -s stationlistfile [-c columnorder] [-m] [-v variable1 [variable2 ...]] [-o outfilename]"
+  echo " "
+  echo "   arguments:" 
+  echo "       dataset          one of NTAL, NTOL, HYDL, SLEL or"
+  echo "                               NTAL24h, NTOL24h NTAL24h+NTOL24h or"
+  echo "                               NTAL+NTOL, NTOL+SLEL, NTAL+NTOL+HYDL, NTAL+NTOL+HYDL+SLEL or all"
+  echo "       frame            CF or CM"
+  echo "       startdate        1st epoch (format: yyyy-mm-dd)"
+  echo "       enddate          last epoch (format: yyyy-mm-dd)"
+  echo "       latitude         latitude of station [degree]"
+  echo "       longitude        longitude of station [degree]"
+  echo "   options:"
+  echo "       -s stationlistname   filename of station coordinate list"
+  echo "                            no header, 2 or 3 columns:"
+  echo "                            [stationname/id] longitude latitude"
+  echo "       -c columnorder       <latlon> or <lonlat>, columnorder in"
+  echo "                            stationlistname file (default=latlon)"
+  echo "                            <xyz> for cartesian coordinates X Y Z"
+  echo "       -m                   apply maskfile to prevent interpolation over the coastline"
+  echo "                            0=land / 1=ocean"
+  echo "       -v list of vars      specify variables from netCDF files"
+  echo "                            (default: duV duNS duEW)"
+  echo "                            only for variable1 [variable2 ...]"
+  echo "       -o outfilename       specify path and file names for output. Non existing path will be created"
+  echo "                            -> outfilename.stationID.txt"
+  echo "                            default is >extractlatlon<."
+  echo " "
+  exit
+fi
+
+# default options
+data=''
+frame=''
+fromdate=''
+todate=''
+lat=''
+lon=''
+stationfile=''
+corder='latlon'
+maskfile=''
+outname='extractlatlon'
+deletetmpdir='yes'
+declare -a vars=('duV' 'duNS' 'duEW')
+
+# read command line arguments
+while [ $# -ne 0 ]
+do
+   case $1 in
+      -m) shift
+          if [[ $1 != -* ]] && [[ $1 != "" ]]
+          then
+             maskfile=$1
+             shift
+          else
+             maskfile="${masksource}"
+          fi
+          
+      ;;
+      -s) shift
+          if [[ $1 != -* ]] && [[ $1 != "" ]]
+          then
+             stationfile=$1
+             shift
+          else  
+             echo "argument of option -s is missing"
+             exit
+          fi
+      ;;
+      -c) shift
+          if [[ $1 != -* ]] && [[ $1 != "" ]]
+          then
+             corder=$1
+             shift   
+          else
+             echo "argument of option -c is missing"
+             exit
+          fi
+      ;;
+      -v) shift
+          if [[ $1 != -* ]] && [[ $1 != "" ]]
+          then
+             vars=("$1")
+             shift
+             nv=0
+             while [ $# -ne $nv ]
+             do
+                if [[ $1 != -* ]] && [[ $1 != "" ]]
+                then
+                   vars=("${vars[@]}" "$1")
+                   shift
+                else   
+                   nv=$#
+                fi   
+             done
+          else
+             echo "argument of option -v is missing"
+             exit
+          fi
+      ;;
+      -o) shift
+          if [[ $1 != -* ]] && [[ $1 != "" ]]
+          then
+             outname=$1
+             shift
+          else  
+             echo "argument of option -o is missing"
+             exit
+          fi
+      ;;
+      -t) shift
+          if [[ $1 != -* ]] && [[ $1 != "" ]]
+          then
+             deletetmpdir=$1
+             shift
+          else  
+             echo "argument of option -t is missing"
+             exit
+          fi
+      ;;
+      *) if [[ $1 = "NTAL" ]] || [[ $1 = "NTOL" ]]
+         then
+            data=("$1")
+            sampling='3h'
+            shift
+         elif [[ $1 = "NTAL24h" ]]
+         then
+            data=("NTAL")
+            sampling='24h'
+            shift
+         elif [[ $1 = "NTOL24h" ]]
+         then
+            data=("NTOL")
+            sampling='24h'
+            shift
+         elif [[ $1 = "HYDL" ]] || [[ $1 = "SLEL" ]]
+         then
+            data=("$1")
+            sampling='24h'
+            shift
+         elif [[ $1 = "NTAL+NTOL" ]] || [[ $1 = "NTOL+NTAL" ]]
+         then
+            data=("NTAL" "NTOL")
+            sampling='3h'
+            shift 
+         elif [[ $1 = "NTAL24h+NTOL24h" ]] || [[ $1 = "NTOL24h+NTAL24h" ]] || [[ $1 = "NTAL24h+NTOL" ]] || [[ $1 = "NTOL24h+NTAL" ]] || [[ $1 = "NTAL+NTOL24h" ]] || [[ $1 = "NTOL+NTAL24h" ]]
+         then
+            data=("NTAL" "NTOL")
+            sampling='24h'
+            shift     
+         elif [[ $1 = "NTAL+HYDL" ]] || [[ $1 = "HYDL+NTAL" ]]
+         then
+            data=("NTAL" "HYDL")
+            sampling='24h'
+            shift  
+         elif [[ $1 = "NTOL+SLEL" ]] || [[ $1 = "SLEL+NTOL" ]]
+         then
+            data=("NTOL" "SLEL")
+            sampling='24h'
+            shift  
+         elif [[ $1 = "HYDL+SLEL" ]] || [[ $1 = "SLEL+HYDL" ]]
+         then
+            data=("HYDL" "SLEL")
+            sampling='24h'
+            shift 
+         elif [[ $1 = "NTAL+NTOL+SLEL" ]] || [[ $1 = "NTOL+NTAL+SLEL" ]]
+         then
+            data=("NTAL" "NTOL" "SLEL")
+            sampling='24h'
+            shift  
+         elif [[ $1 = "NTAL+NTOL+HYDL" ]] || [[ $1 = "NTOL+NTAL+HYDL" ]] || [[ $1 = "HYDL+NTOL+NTAL" ]] || [[ $1 = "HYDL+NTAL+NTOL" ]] || [[ $1 = "NTAL+HYDL+NTOL" ]] || [[ $1 = "NTOL+HYDL+NTAL" ]]
+         then
+            data=("NTAL" "NTOL" "HYDL")
+            sampling='24h'
+            shift  
+         elif [[ $1 = "NTAL+NTOL+HYDL+SLEL" ]] || [[ $1 = "NTOL+NTAL+HYDL+SLEL" ]] || [[ $1 = "NTAL+NTOL+SLEL+HYDL" ]] || [[ $1 = "NTOL+NTAL+SLEL+HYDL" ]] || [[ $1 = "all" ]]
+         then         
+            data=("NTAL" "NTOL" "HYDL" "SLEL")
+            sampling='24h'
+            shift  
+         elif [[ $1 = "CF" ]] || [[ $1 = "CM" ]] || [[ $1 = "cf" ]] || [[ $1 = "cm" ]]
+         then
+            frame=`echo $1 | tr a-z A-Z`
+            shift
+         elif [[ `echo $1 | cut -c 5-5` = "-" ]] && [[ `echo $1 | cut -c 8-8` = "-" ]]  
+         then 
+            if [[ $fromdate = "" ]]
+            then
+               fromdate=$1
+            else
+               todate=$1
+            fi
+            shift
+         elif [[ `echo $1 | awk '{print $1+0==0}'` = "1" ]]
+         then
+            if [[ $1 = -* ]] && [[ $1 != "" ]]
+            then
+               echo "option $1 not valid"
+            else   
+               echo "latitude $1 not a number"
+            fi   
+            exit
+         else 
+            lat=$1
+            shift 
+            if [[ `echo $1 | awk '{print $1+0==0}'` = "1" ]] 
+            then
+               if [[ $1 = -* ]] && [[ $1 != "" ]]
+               then
+                  echo "longitude is missing"
+               else  
+                  echo "longitude $1 not a number"
+               fi   
+               exit
+            else   
+               lon=$1
+               shift 
+               station="1"
+               stationfile="no"            
+            fi
+         fi   
+      ;;   
+   esac
+done
+
+# check arguments 
+if [[ $data = "" ]]
+then
+   echo "wrong or missing argument <dataset> - job aborted"
+   exit
+fi   
+if [[ $frame = "" ]] 
+then
+   echo "wrong or missing argument <frame> - job aborted"
+   exit
+fi   
+if [[ $fromdate = "" ]] || [[ $todate = "" ]]
+then
+   echo "argument <startdate>, <enddate> are missing - job aborted"
+   exit
+fi   
+if [[ $stationfile = "" ]]
+then
+   echo "Station coordinates missing - job aborted"
+   exit
+fi   
+if [ ! -r $stationfile ] && [[ $stationfile != "no" ]]
+then
+   echo "Cannot read $stationfile - job aborted"
+   exit
+fi 
+
+# output directory ############################################################
+outdir=`dirname "$outname"`
+outname=`basename "$outname"`
+if [[ $outdir != "" ]]
+then
+   if [[ ! -d $outdir ]]
+   then
+      mkdir $outdir
+   fi 
+   outdir="${outdir}/"
+fi
+
+# temporary directory #########################################################
+if [[ ! -d $tmpdir ]]
+then
+   mkdir $tmpdir
+else
+   if [[ $deletetmpdir = "yes" ]]
+   then
+      rm -rf $tmpdir/*
+   else
+      echo "ATTENTION: re-use of already downloaded datasets (do not use option -t no, if you changed the models, station or epochs)"
+      rm -f $tmpdir/part_cols*.txt
+      rm -f $tmpdir/add_part_cols*.txt*
+   fi
+fi   
+
+# define cleanup function for background processes ############################
+function cleanup
+{
+      local pids=$(jobs -pr)
+      if [ -n "${pids}" ]
+      then 
+         echo "... terminate background processes ${pids}"
+         kill ${pids}
+      fi   
+      if [ -d $tmpdir ] && [[ $deletetmpdir = "yes" ]]
+      then
+         echo "... cleanup tempory directory ${tmpdir}"
+         rm -rf $tmpdir
+      fi   
+      exit
+}
+trap "cleanup" INT QUIT TERM EXIT
+   
+# get maskfile and check NCO library ##########################################
+if [[ ${maskfile} != "" ]]
+then
+   if [[ ${maskfile} == ${masksource} ]]
+   then
+      # download maskfile from RAMADDA
+      curl -s -o ${tmpdir}/maskfile.nc ${maskfile}
+   else
+      cp -f ${maskfile} ${tmpdir}/maskfile.nc
+   fi   
+   if [ ! -r ${tmpdir}/maskfile.nc ]
+      then
+      echo "Cannot get ${maskfile} - job aborted"
+      exit
+   fi
+   # check NCO library
+   ncks=`command -v ${ncopath}ncks`
+   if [[ ${ncks} = "" ]]
+   then
+      echo "WARNING: Cannot find ${ncopath}ncks. - continue without option -m"
+      maskfile=''
+   else
+      maskfile="${tmpdir}/maskfile.nc"
+      # since NCO 4.7.0 ncks print output in CDL format, --trd changes to traditional format
+      ncksversion=`${ncks} --version 2>&1 |  awk '( NR==2 ) {print $3}' | sed -e 's/\.//g'`    
+      if [ ${ncksversion} -gt 470 ]
+      then
+         ncks="${ncks} --trd"
+      fi   
+   fi   
+fi
+
+# check variables #############################################################
+variables=''
+for var in ${vars[@]}
+do
+   if [[ $var != "time" ]]
+   then      
+      if [[ $var = "duV" ]] || [[ $var = "duEW" ]] || [[ $var = "duNS" ]]
+      then
+         variables="${variables}&variable=${var}"   
+      elif [[ $var = "dg" ]] && [[ $data = "HYDL" ]]
+      then
+         variables="${variables}&variable=${var}"
+      else
+         echo "WARNING: variable <$var> is not in dataset" 
+      fi
+   fi   
+done
+
+# check arguments (Lat / Lon culumn order) ####################################
+if [[ $corder != "lonlat" ]] && [[ $corder != "xyz" ]]
+then
+    corder="latlon"
+fi  
+
+# prepare parameters for XYZ -> Lat Lon ########################################
+# WGS84 ellipsoidal parameters
+if [[ $corder = "xyz" ]]
+then
+   axis_a="6378137.0"
+   axis_b="6366752.3142"
+   flat1=$(echo "($axis_a^2 - $axis_b^2) / $axis_a^2" | bc -l) 
+   flat2=$(echo "($axis_a^2 - $axis_b^2) / $axis_b^2" | bc -l) 
+   Pi=$(echo "4 * a(1)" | bc -l) 
+   echo "... convert XYZ to Lat Lon"
+fi
+       
+# read station positions ######################################################
+if [[ $stationfile != "no" ]]
+then
+   ncol=`awk '{print NF; exit}' $stationfile`
+   nrow=`awk 'END{print NR; exit}' $stationfile`
+   echo "... read Stationlist ($ncol x $nrow)"
+   for i in $(seq 1 $nrow)
+   do
+      if [[ $corder != "xyz" ]]
+      then
+         # lat lon columns -----------------         
+         if [ $ncol -gt 2 ]
+         then               
+            col1=`awk -v i=$i 'FNR==i{print $1; exit}' $stationfile`        
+            col2=`awk -v i=$i 'FNR==i{print $2; exit}' $stationfile`
+            col3=`awk -v i=$i 'FNR==i{print $3; exit}' $stationfile`     
+         else         
+            col1="$i"
+            col2=`awk -v i=$i 'FNR==i{print $1; exit}' $stationfile`
+            col3=`awk -v i=$i 'FNR==i{print $2; exit}' $stationfile`
+         fi
+      else
+         # X Y Z columns ----------------- 
+         if [ $ncol -gt 3 ]
+         then
+            col1=`awk -v i=$i 'FNR==i{print $1; exit}' $stationfile`
+            xxx=`awk -v i=$i 'FNR==i{print $2; exit}' $stationfile`
+            yyy=`awk -v i=$i 'FNR==i{print $3; exit}' $stationfile`
+            zzz=`awk -v i=$i 'FNR==i{print $4; exit}' $stationfile`
+         else 
+            col1="$i"
+            xxx=`awk -v i=$i 'FNR==i{print $1; exit}' $stationfile`
+            yyy=`awk -v i=$i 'FNR==i{print $2; exit}' $stationfile`
+            zzz=`awk -v i=$i 'FNR==i{print $3; exit}' $stationfile`
+         fi
+         # convert X Y Z into Lat Lon ----
+         P=$(echo "sqrt( $xxx^2 + $yyy^2 )" | bc -l) 
+         G=$(echo "a( $zzz / $P * $axis_a / $axis_b )" | bc -l) 
+         Y1=$(echo "$zzz + $flat2 * $axis_b * (s( $G ))^3" | bc -l) 
+         X1=$(echo "$P - $flat1 * $axis_a * (c( $G ))^3" | bc -l) 
+         sign=$(echo "$X1 > 0.0" | bc -l) 
+         if [ $sign -eq 1 ]
+         then
+            col2=$(echo "a( $Y1 / $X1 ) * 180.0 / $Pi" | bc -l) 
+         else
+            sign=$(echo "$>1 < 0.0" | bc -l) 
+            if [ $sign -eq 1 ]
+            then
+               col2=$(echo "a( $Y1 / $X1 ) * 180 / $Pi - 180.0" | bc -l) 
+            else
+               col2=$(echo "a( $Y1 / $X1 ) * 180 / $Pi + 180.0" | bc -l) 
+            fi
+         fi
+         sign=$(echo "$xxx > 0.0" | bc -l) 
+         if [ $sign -eq 1 ]
+         then
+            col3=$(echo "a( $yyy / $xxx ) * 180 / $Pi" | bc -l)
+         else
+            sign=$(echo "$yyy < 0.0" | bc -l) 
+            if [ $sign -eq 1 ]
+            then
+               col3=$(echo "a( $yyy / $xxx ) * 180 / $Pi - 180.0" | bc -l)
+            else
+               col3=$(echo "a( $yyy / $xxx ) * 180 / $Pi + 180.0" | bc -l)
+            fi
+         fi
+      fi 
+      # add station coordinates to station list ----------------------------------------
+      if [[ $col2 != "" ]] && [[ $col3 != "" ]]
+      then
+         # check column order 
+         if [[ $corder = "lonlat" ]]
+         then        
+            dummy=$col2
+            col2=$col3
+            col3=$dummy         
+         fi  
+         # check for longitude format (subtract 360 when lon>180)        
+         biglon=$(echo "${col3} > 180.0" | bc -l)        
+         if [ $biglon -eq 1 ]
+         then       
+            col3=$(echo "${col3} - 360.0" | bc -l)          
+         fi
+         # check for latitude (should be -90 -> +90)
+         biglat=$(echo "sqrt(${col2}*${col2}) > 90.0" | bc -l)   
+         if [ $biglat -eq 1 ]
+         then  
+            echo "latitude out of bounds (-90 < lat < 90) - job aborted"
+            echo "(maybe latitude / longitudes are switched, try option -c lonlat)"
+            exit
+         fi
+         # append to station list
+         if [ $i -eq 1 ]
+         then 
+            station=$col1
+            lat=$col2
+            lon=$col3
+         else
+            station=("${station[@]}" "$col1")
+            lat=("${lat[@]}" "$col2")
+            lon=("${lon[@]}" "$col3")
+         fi
+      fi
+   done
+fi   
+if [ ${#station[@]} -lt 1 ]
+then
+   echo "... cannot read station file - job terminated"
+   exit
+fi
+
+# translate dataset and epoch information into a list of RAMADDA entrypath ####
+# RAMADDA stores the individual netCDF files in subdirectories containing about 
+# 10 individual year-files. Access is allowed to individual files, but also to 
+# directories or directory-structures handling their netcdf files als aggregated,
+# joined along the time axis. This script performs parallel download of data subset 
+# from the relevant 10-year folders and concatenate the subsets afterwards.
+if [ `date -d ${fromdate} +%s` -lt `date -d 1990-01-01 +%s` ]
+then
+   entrypath=("1976-1999/1976-1989")
+   if [ `date -d ${todate} +%s` -ge `date -d 1990-01-01 +%s` ] 
+   then
+      entrypath=("${entrypath[@]}" "1976-1999/1990-1999")
+      if [ `date -d ${todate} +%s` -ge `date -d 2000-01-01 +%s` ] 
+      then
+         entrypath=("${entrypath[@]}" "2000-now/2000-2009")
+		 if [ `date -d ${todate} +%s` -ge `date -d 2010-01-01 +%s` ] 
+         then
+            entrypath=("${entrypath[@]}" "2000-now/2010-now")
+		 fi
+      fi
+   fi
+elif [ `date -d ${fromdate} +%s` -lt `date -d 2000-01-01 +%s` ]
+then
+   entrypath=("1976-1999/1990-1999")
+   if [ `date -d ${todate} +%s` -ge `date -d 2000-01-01 +%s` ] 
+   then
+      entrypath=("${entrypath[@]}" "2000-now/2000-2009")
+	  if [ `date -d ${todate} +%s` -ge `date -d 2010-01-01 +%s` ] 
+      then
+         entrypath=("${entrypath[@]}" "2000-now/2010-now")
+	  fi
+   fi
+elif [ `date -d ${fromdate} +%s` -lt `date -d 2010-01-01 +%s` ]
+then
+   entrypath=("2000-now/2000-2009")
+   if [ `date -d ${todate} +%s` -ge `date -d 2010-01-01 +%s` ] 
+   then
+      entrypath=("${entrypath[@]}" "2000-now/2010-now")
+   fi
+else
+   entrypath=("2000-now/2010-now")
+fi
+
+
+###############################################################################
+# loop over station coordinates ###############################################
+istation=0
+while [ $istation -lt ${#station[@]} ]
+do
+   latout="${lat[$istation]}"
+   lonout="${lon[$istation]}"
+   
+   if [ ${#station} -gt 1 ]
+   then
+      echo "... extract time series for station ${station[$istation]}  lat:$latout / lon:$lonout  ($((istation+1))/${#station[@]})"
+      outfile="${outdir}${outname}.${station[$istation]}.txt"
+   else
+      echo "... extract time series for station lat:$latout / lon:$lonout"
+      outfile="${outdir}${outname}.txt"
+   fi
+   touch $outfile
+   rm -f $outfile
+   
+   # prevent interpolation over the coastline ---------------------------------
+   # check 4 gridcells around station position in maskfile      |      |      |
+   interp=1 # (0=nearest neighbour, 1=bilinear)                 |  g1  |  g2  |     
+   if [[ ${maskfile} != "" ]]                              #    |      |      |        
+   then                                                    #    ---------------
+      lon1=$(echo "${lonout} - 0.25 " | bc -l)             #    |      |s     |
+      lon2=$(echo "${lonout} + 0.25 " | bc -l)             #    |  g3  |  g4  |
+      lat1=$(echo "${latout} + 0.25 " | bc -l)             #    |      |      |
+      lat2=$(echo "${latout} - 0.25 " | bc -l)             #    ---------------
+      # if dimensions in netCDF are lat/lon
+      gs=$(${ncks} -Q --no_nm_prn -H -d lon,${lonout},${lonout} -d lat,${latout},${latout} ${maskfile} | grep '^[0|1]$')
+      g1=$(${ncks} -Q --no_nm_prn -H -d lon,${lon1},${lon1} -d lat,${lat1},${lat1} ${maskfile} | grep '^[0|1]$')
+      g2=$(${ncks} -Q --no_nm_prn -H -d lon,${lon2},${lon2} -d lat,${lat1},${lat1} ${maskfile} | grep '^[0|1]$')
+      g3=$(${ncks} -Q --no_nm_prn -H -d lon,${lon1},${lon1} -d lat,${lat2},${lat2} ${maskfile} | grep '^[0|1]$')
+      g4=$(${ncks} -Q --no_nm_prn -H -d lon,${lon2},${lon2} -d lat,${lat2},${lat2} ${maskfile} | grep '^[0|1]$')
+      # if dimensions in netCDF are latitude/longitude
+      if [[ $gs = "" ]] || [[ $g1 = "" ]]
+      then 
+         gs=$(${ncks} -Q --no_nm_prn -H -d longitude,${lonout},${lonout} -d latitude,${latout},${latout} ${maskfile} | grep '^[0|1]$')
+         g1=$(${ncks} -Q --no_nm_prn -H -d longitude,${lon1},${lon1} -d latitude,${lat1},${lat1} ${maskfile} | grep '^[0|1]$')
+         g2=$(${ncks} -Q --no_nm_prn -H -d longitude,${lon2},${lon2} -d latitude,${lat1},${lat1} ${maskfile} | grep '^[0|1]$')
+         g3=$(${ncks} -Q --no_nm_prn -H -d longitude,${lon1},${lon1} -d latitude,${lat2},${lat2} ${maskfile} | grep '^[0|1]$')
+         g4=$(${ncks} -Q --no_nm_prn -H -d longitude,${lon2},${lon2} -d latitude,${lat2},${lat2} ${maskfile} | grep '^[0|1]$')
+      fi
+      if [[ $gs = "" ]] || [[ $g1 = "" ]]
+      then 
+         echo "Cannot read dimensions in maskfile $maskfile - job aborted"
+         exit 
+      fi       
+      # station has land and ocean gridcells around
+      if [[ $gs -ne $g1  ]] || [[ $gs -ne $g2 ]] || [[ $gs -ne $g3 ]] || [[ $gs -ne $g4 ]]
+      then
+         if [[ $gs = "1" ]]
+         then
+            echo "    -> detected station location in the ocean (1=ocean) !!!"
+         else   
+            echo "    -> detected station at the coastline (1=ocean)" 
+         fi   
+         echo "                  $g1  $g2"
+         echo "                  $g3  $g4"  
+         if [[ $gs = "0" ]]
+         then
+            interp=0
+            echo "       use nearest gridpoint to avoid interpolation over coastline"
+         fi
+      fi
+   fi   
+     
+   # gridcell of station location --------------------------------------------- 
+   # assuming 0.5°x0.5° regular grid 
+   lon0=$(echo "scale=0; if (${lonout}>0) v=((${lonout}+0.25)*2+0.5)/1 else v=((${lonout}+0.25)*2-0.5)/1; scale=2; v/2-0.25" | bc -l)
+   lat0=$(echo "scale=0; if (${latout}>0) v=((${latout}+0.25)*2+0.5)/1 else v=((${latout}+0.25)*2-0.5)/1; scale=2; v/2-0.25" | bc -l)
+   # 4 gridcells surrounding station location ---------------------------------
+   lon1=$(echo "scale=0; if (${lonout}-0.25>0) v=((${lonout}-0.25+0.25)*2+0.5)/1 else v=((${lonout}-0.25+0.25)*2-0.5)/1; scale=2; v/2-0.25" | bc -l)
+   lat1=$(echo "scale=0; if (${latout}+0.25>0) v=((${latout}+0.25+0.25)*2+0.5)/1 else v=((${latout}+0.25+0.25)*2-0.5)/1; scale=2; v/2-0.25" | bc -l)
+   lon2=$(echo "scale=0; if (${lonout}+0.25>0) v=((${lonout}+0.25+0.25)*2+0.5)/1 else v=((${lonout}+0.25+0.25)*2-0.5)/1; scale=2; v/2-0.25" | bc -l)
+   lat2=$(echo "scale=0; if (${latout}-0.25>0) v=((${latout}-0.25+0.25)*2+0.5)/1 else v=((${latout}-0.25+0.25)*2-0.5)/1; scale=2; v/2-0.25" | bc -l)
+   
+   
+   # download grid point time series from RAMADDA server ###################
+   # do this for all RAMADDA data sets and entrypath in parallel ###########
+   # check if RAMADDA server is accessable #################################
+   # get identity of running server instance from running.html file ########
+   iserver=0
+   while [[ $iserver -lt 5 ]]
+   do
+      if [ `curl -s -I ${ramadda} | head -1 | grep -c "200 OK"` -eq 0 ]
+      then
+         if [ ${iserver} < 5 ]
+         then
+            echo "... access to ${ramadda} failed - retry"
+         else
+            echo "... access to ${ramadda} failed - job terminated"
+            echo "Please try it again later"
+            exit 
+         fi 
+         iserver=$((iserver+1))
+      else
+         iserver=5
+         running_since=$(curl -s http://esmdata.gfz-potsdam.de:8080/repository/running_since/running.html)
+      fi
+   done
+   
+   iserver=0
+   while [ $iserver -lt 5 ]
+   do
+      idata=0
+      while [ $idata -lt ${#data[@]} ]
+      do
+         datapath="Home/Elastic+Surface+Loading/${data[$idata]}/${frame}"  
+   
+         ientry=0
+         while [ $ientry -lt ${#entrypath[@]} ]
+         do
+		    urlbase="${ramadda}/entry/show/${datapath}/${entrypath[$ientry]}"'?'"submit=Get%20Point&output=data.gridaspoint"
+		    # old RAMADDA version -> &variable=duV,duNS,duEW,dg
+			#    urlbase="${urlbase}&variable=${variables}&format=csv&calendar=proleptic_gregorian"
+            # new RAMADDA version -> &variable=duV&variable=duNS&variable=duEW&variable=dg
+			urlbase="${urlbase}${variables}&format=csv&calendar=proleptic_gregorian"
+            urlbase="${urlbase}&fromdate=${fromdate}%2000%3A00%3A00%20UTC&todate=${todate}%2021%3A00%3A00%20UTC"
+		 
+            if [ ${interp} -eq 0 ]
+            then
+               # nearest neighbour -----------------------------------------------------
+               url="${urlbase}&location.longitude=${lon0}&location.latitude=${lat0}"
+               if [[ $deletetmpdir = "yes" ]] || ! [ -r ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_1.txt ]
+               then
+                  curl -s -o ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_1.txt ${url} &
+               fi
+            else
+               # bilinear interpolation ------------------------------------------------
+               url="${urlbase}&location.longitude=${lon1}&location.latitude=${lat1}"
+			   if [[ $deletetmpdir = "yes" ]] || ! [ -r ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_1.txt ]
+               then
+                  curl -s -o ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_1.txt ${url} &
+               fi
+               url="${urlbase}&location.longitude=${lon2}&location.latitude=${lat1}"
+               if [[ $deletetmpdir = "yes" ]] || ! [ -r ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_2.txt ]
+               then
+                  curl -s -o ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_2.txt ${url} &
+               fi
+               url="${urlbase}&location.longitude=${lon1}&location.latitude=${lat2}"
+               if [[ $deletetmpdir = "yes" ]] || ! [ -r ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_3.txt ]
+               then
+                  curl -s -o ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_3.txt ${url} &
+               fi
+               url="${urlbase}&location.longitude=${lon2}&location.latitude=${lat2}"
+               if [[ $deletetmpdir = "yes" ]] || ! [ -r ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_4.txt ]
+               then
+                  curl -s -o ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_4.txt ${url} &
+               fi
+            fi
+            echo "    -> started download from ${datapath}/${entrypath[$ientry]}"
+      
+            ientry=$((ientry+1))
+         done
+      
+         idata=$((idata+1))
+      done
+   
+      wait
+
+      # end of parallel #######################################################
+
+      # check of identity of running server instance is still the same (no restart)
+      # retry in case the server was restarted or missing downloaded files 
+      icheck=0
+      running_check=$(curl -s http://esmdata.gfz-potsdam.de:8080/repository/running_since/running.html)
+      if [[ ${running_check} = ${running_since} ]]
+      then 
+         # check downloaded files
+         icheck=1
+         idata=0
+         while [ $idata -lt ${#data[@]} ]
+         do
+            ientry=0
+            while [ $ientry -lt ${#entrypath[@]} ]
+            do
+               if ! [ -r ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_1.txt ]
+               then
+                  echo "      - download of gridcell 1 of ${data[$idata]}/${frame}/${entrypath[$ientry]} failed"
+                  icheck=0
+               fi
+               if [ ${interp} -eq 1 ]
+               then
+                  if ! [ -r ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_2.txt ]
+                  then
+                     echo "      - download of gridcell 2 from ${data[$idata]}/${frame}/${entrypath[$ientry]} failed"
+                     icheck=0
+                  fi
+                  if ! [ -r ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_3.txt ]
+                  then
+                     echo "      - download of gridcell 3 from ${data[$idata]}/${frame}/${entrypath[$ientry]} failed"
+                     icheck=0
+                  fi
+                  if ! [ -r ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_4.txt ]
+                  then
+                     echo "      - download of gridcell 4 from ${data[$idata]}/${frame}/${entrypath[$ientry]} failed"
+                     icheck=0
+                  fi
+               fi
+               ientry=$((ientry+1))
+            done
+            idata=$((idata+1))
+         done
+      else
+         echo "... daily server reset happened during download"
+         running_since=$(curl -s http://esmdata.gfz-potsdam.de:8080/repository/running_since/running.html)
+      fi   
+      if [ ${icheck} -eq 0 ]
+      then
+         iserver=$((iserver+1))
+         if [ ${iserver} -lt 5 ]
+         then
+            echo "... download failed - automatic retry (${iserver}) in 60s"
+			sleep 60
+         else
+            echo "... download failed - job terminated"
+            echo "Please try it again later"
+            exit 
+         fi 
+      else
+         iserver=5
+      fi
+   done   
+   
+   # sum up the individual data sources (NTAL,NTOL,HYDL,SLEL) #################
+   echo "    -> sum up / interpolate ..."
+   ientry=0
+   while [ $ientry -lt ${#entrypath[@]} ]
+   do
+      idata=0     
+      # extract header
+      head -n 1 ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_1.txt > ${tmpdir}/part_head.txt
+      # number of variables
+      nvars=$(awk -F "," 'NR==2 { print NF }' ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_1.txt) 
+      nvars=$(echo "${nvars}-3" | bc -l)
+      
+      # extract time and data columns
+      sed '1d' ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_1.txt > ${tmpdir}/part_cols_1.txt
+      if [ ${interp} -eq 1 ]
+      then
+         # extract time and data columns
+         sed '1d' ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_2.txt > ${tmpdir}/part_cols_2.txt
+         sed '1d' ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_3.txt > ${tmpdir}/part_cols_3.txt
+         sed '1d' ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_4.txt > ${tmpdir}/part_cols_4.txt
+      fi   
+      
+      # resample 3h -> 24h
+      if [[ ${data[$idata]} = "NTAL" ]] || [[ ${data[$idata]} = "NTOL" ]]
+      then
+         if [[ ${sampling} = "24h" ]]
+         then
+            awk -F "," '(NR-5)%8==0 {print $1","$2","$3 }' ${tmpdir}/part_cols_1.txt > ${tmpdir}/part_cols_1_time.txt
+            if [ ${interp} -eq 1 ]
+            then
+               awk -F "," '(NR-5)%8==0 {print $1","$2","$3 }' ${tmpdir}/part_cols_2.txt > ${tmpdir}/part_cols_2_time.txt
+               awk -F "," '(NR-5)%8==0 {print $1","$2","$3 }' ${tmpdir}/part_cols_3.txt > ${tmpdir}/part_cols_3_time.txt
+               awk -F "," '(NR-5)%8==0 {print $1","$2","$3 }' ${tmpdir}/part_cols_4.txt > ${tmpdir}/part_cols_4_time.txt
+            fi
+ 
+            if [ $nvars -eq 1 ]
+            then
+               awk -F "," '{sum4+=$4}!(NR%8){print sum4/8; sum4=0}' ${tmpdir}/part_cols_1.txt > ${tmpdir}/part_cols_1_data.txt
+               if [ ${interp} -eq 1 ]
+               then
+                  awk -F "," '{sum4+=$4}!(NR%8){print sum4/8; sum4=0}' ${tmpdir}/part_cols_2.txt > ${tmpdir}/part_cols_2_data.txt
+                  awk -F "," '{sum4+=$4}!(NR%8){print sum4/8; sum4=0}' ${tmpdir}/part_cols_3.txt > ${tmpdir}/part_cols_3_data.txt
+                  awk -F "," '{sum4+=$4}!(NR%8){print sum4/8; sum4=0}' ${tmpdir}/part_cols_4.txt > ${tmpdir}/part_cols_4_data.txt
+               fi
+            elif [ $nvars -eq 2 ]
+            then
+               awk -F "," '{sum4+=$4; sum5+=$5}!(NR%8){print sum4/8","sum5/8; sum4=0; sum5=0}' ${tmpdir}/part_cols_1.txt > ${tmpdir}/part_cols_1_data.txt
+               if [ ${interp} -eq 1 ]
+               then
+                  awk -F "," '{sum4+=$4; sum5+=$5}!(NR%8){print sum4/8","sum5/8; sum4=0; sum5=0}' ${tmpdir}/part_cols_2.txt > ${tmpdir}/part_cols_2_data.txt
+                  awk -F "," '{sum4+=$4; sum5+=$5}!(NR%8){print sum4/8","sum5/8; sum4=0; sum5=0}' ${tmpdir}/part_cols_3.txt > ${tmpdir}/part_cols_3_data.txt
+                  awk -F "," '{sum4+=$4; sum5+=$5}!(NR%8){print sum4/8","sum5/8; sum4=0; sum5=0}' ${tmpdir}/part_cols_4.txt > ${tmpdir}/part_cols_4_data.txt
+               fi
+            elif [ $nvars -eq 3 ]
+            then
+               awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6}!(NR%8){print sum4/8","sum5/8","sum6/8; sum4=0; sum5=0; sum6=0}' ${tmpdir}/part_cols_1.txt > ${tmpdir}/part_cols_1_data.txt
+               if [ ${interp} -eq 1 ]
+               then
+                  awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6}!(NR%8){print sum4/8","sum5/8","sum6/8; sum4=0; sum5=0; sum6=0}' ${tmpdir}/part_cols_2.txt > ${tmpdir}/part_cols_2_data.txt
+                  awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6}!(NR%8){print sum4/8","sum5/8","sum6/8; sum4=0; sum5=0; sum6=0}' ${tmpdir}/part_cols_3.txt > ${tmpdir}/part_cols_3_data.txt
+                  awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6}!(NR%8){print sum4/8","sum5/8","sum6/8; sum4=0; sum5=0; sum6=0}' ${tmpdir}/part_cols_4.txt > ${tmpdir}/part_cols_4_data.txt
+               fi
+            elif [ $nvars -eq 4 ]
+            then
+               awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6; sum+=$7}!(NR%8){print sum4/8","sum5/8","sum6/8","sum7/8; sum4=0; sum5=0; sum6=0; sum7=0}' ${tmpdir}/part_cols_1.txt > ${tmpdir}/part_cols_1_data.txt
+               if [ ${interp} -eq 1 ]
+               then
+                  awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6; sum+=$7}!(NR%8){print sum4/8","sum5/8","sum6/8","sum7/8; sum4=0; sum5=0; sum6=0; sum7=0}' ${tmpdir}/part_cols_2.txt > ${tmpdir}/part_cols_2_data.txt
+                  awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6; sum+=$7}!(NR%8){print sum4/8","sum5/8","sum6/8","sum7/8; sum4=0; sum5=0; sum6=0; sum7=0}' ${tmpdir}/part_cols_3.txt > ${tmpdir}/part_cols_3_data.txt
+                  awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6; sum+=$7}!(NR%8){print sum4/8","sum5/8","sum6/8","sum7/8; sum4=0; sum5=0; sum6=0; sum7=0}' ${tmpdir}/part_cols_4.txt > ${tmpdir}/part_cols_4_data.txt
+               fi
+            fi
+            paste -d',' ${tmpdir}/part_cols_1_time.txt ${tmpdir}/part_cols_1_data.txt > ${tmpdir}/part_cols_1.new        
+            mv -f ${tmpdir}/part_cols_1.new ${tmpdir}/part_cols_1.txt
+            
+            if [ ${interp} -eq 1 ]
+            then
+               paste -d',' ${tmpdir}/part_cols_2_time.txt ${tmpdir}/part_cols_2_data.txt > ${tmpdir}/part_cols_2.new
+               paste -d',' ${tmpdir}/part_cols_3_time.txt ${tmpdir}/part_cols_3_data.txt > ${tmpdir}/part_cols_3.new
+               paste -d',' ${tmpdir}/part_cols_4_time.txt ${tmpdir}/part_cols_4_data.txt > ${tmpdir}/part_cols_4.new
+               mv -f ${tmpdir}/part_cols_2.new ${tmpdir}/part_cols_2.txt
+               mv -f ${tmpdir}/part_cols_3.new ${tmpdir}/part_cols_3.txt
+               mv -f ${tmpdir}/part_cols_4.new ${tmpdir}/part_cols_4.txt
+            fi
+         fi   
+      fi   
+
+      # add further data columns
+      idata=1
+      while [ $idata -lt ${#data[@]} ]
+      do    
+         # extract next time and data columns
+         sed '1d' ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_1.txt > ${tmpdir}/add_part_cols_1.txt
+         if [ ${interp} -eq 1 ]
+         then
+            sed '1d' ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_2.txt > ${tmpdir}/add_part_cols_2.txt
+            sed '1d' ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_3.txt > ${tmpdir}/add_part_cols_3.txt
+            sed '1d' ${tmpdir}/data${istation}_${idata}_part_${ientry}_grid_4.txt > ${tmpdir}/add_part_cols_4.txt
+         fi   
+         
+         # resample 3h -> 24h
+         if [[ ${data[$idata]} = "NTAL" ]] || [[ ${data[$idata]} = "NTOL" ]]
+         then
+            if [[ ${sampling} = "24h" ]]
+            then
+               awk -F "," '(NR-5)%8==0 {print $1","$2","$3 }' ${tmpdir}/add_part_cols_1.txt > ${tmpdir}/add_part_cols_1_time.txt
+               if [ ${interp} -eq 1 ]
+               then
+                  awk -F "," '(NR-5)%8==0 {print $1","$2","$3 }' ${tmpdir}/add_part_cols_2.txt > ${tmpdir}/add_part_cols_2_time.txt
+                  awk -F "," '(NR-5)%8==0 {print $1","$2","$3 }' ${tmpdir}/add_part_cols_3.txt > ${tmpdir}/add_part_cols_3_time.txt
+                  awk -F "," '(NR-5)%8==0 {print $1","$2","$3 }' ${tmpdir}/add_part_cols_4.txt > ${tmpdir}/add_part_cols_4_time.txt
+               fi
+               if [ $nvars -eq 1 ]
+               then
+                  awk -F "," '{sum4+=$4}!(NR%8){print sum4/8; sum4=0}' ${tmpdir}/add_part_cols_1.txt > ${tmpdir}/add_part_cols_1_data.txt
+                  if [ ${interp} -eq 1 ]
+                  then
+                     awk -F "," '{sum4+=$4}!(NR%8){print sum4/8; sum4=0}' ${tmpdir}/add_part_cols_2.txt > ${tmpdir}/add_part_cols_2_data.txt
+                     awk -F "," '{sum4+=$4}!(NR%8){print sum4/8; sum4=0}' ${tmpdir}/add_part_cols_3.txt > ${tmpdir}/add_part_cols_3_data.txt
+                     awk -F "," '{sum4+=$4}!(NR%8){print sum4/8; sum4=0}' ${tmpdir}/add_part_cols_4.txt > ${tmpdir}/add_part_cols_4_data.txt
+                  fi
+               elif [ $nvars -eq 2 ]
+               then
+                  awk -F "," '{sum4+=$4; sum5+=$5}!(NR%8){print sum4/8","sum5/8; sum4=0; sum5=0}' ${tmpdir}/add_part_cols_1.txt > ${tmpdir}/add_part_cols_1_data.txt
+                  if [ ${interp} -eq 1 ]
+                  then
+                     awk -F "," '{sum4+=$4; sum5+=$5}!(NR%8){print sum4/8","sum5/8; sum4=0; sum5=0}' ${tmpdir}/add_part_cols_2.txt > ${tmpdir}/add_part_cols_2_data.txt
+                     awk -F "," '{sum4+=$4; sum5+=$5}!(NR%8){print sum4/8","sum5/8; sum4=0; sum5=0}' ${tmpdir}/add_part_cols_3.txt > ${tmpdir}/add_part_cols_3_data.txt
+                     awk -F "," '{sum4+=$4; sum5+=$5}!(NR%8){print sum4/8","sum5/8; sum4=0; sum5=0}' ${tmpdir}/add_part_cols_4.txt > ${tmpdir}/add_part_cols_4_data.txt
+                  fi
+               elif [ $nvars -eq 3 ]
+               then
+                  awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6}!(NR%8){print sum4/8","sum5/8","sum6/8; sum4=0; sum5=0; sum6=0}' ${tmpdir}/add_part_cols_1.txt > ${tmpdir}/add_part_cols_1_data.txt
+                  if [ ${interp} -eq 1 ]
+                  then
+                     awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6}!(NR%8){print sum4/8","sum5/8","sum6/8; sum4=0; sum5=0; sum6=0}' ${tmpdir}/add_part_cols_2.txt > ${tmpdir}/add_part_cols_2_data.txt
+                     awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6}!(NR%8){print sum4/8","sum5/8","sum6/8; sum4=0; sum5=0; sum6=0}' ${tmpdir}/add_part_cols_3.txt > ${tmpdir}/add_part_cols_3_data.txt
+                     awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6}!(NR%8){print sum4/8","sum5/8","sum6/8; sum4=0; sum5=0; sum6=0}' ${tmpdir}/add_part_cols_4.txt > ${tmpdir}/add_part_cols_4_data.txt
+                  fi
+               elif [ $nvars -eq 4 ]
+               then
+                  awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6; sum+=$7}!(NR%8){print sum4/8","sum5/8","sum6/8","sum7/8; sum4=0; sum5=0; sum6=0; sum7=0}' ${tmpdir}/add_part_cols_1.txt > ${tmpdir}/add_part_cols_1_data.txt
+                  if [ ${interp} -eq 1 ]
+                  then
+                     awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6; sum+=$7}!(NR%8){print sum4/8","sum5/8","sum6/8","sum7/8; sum4=0; sum5=0; sum6=0; sum7=0}' ${tmpdir}/add_part_cols_2.txt > ${tmpdir}/add_part_cols_2_data.txt
+                     awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6; sum+=$7}!(NR%8){print sum4/8","sum5/8","sum6/8","sum7/8; sum4=0; sum5=0; sum6=0; sum7=0}' ${tmpdir}/add_part_cols_3.txt > ${tmpdir}/add_part_cols_3_data.txt
+                     awk -F "," '{sum4+=$4; sum5+=$5; sum6+=$6; sum+=$7}!(NR%8){print sum4/8","sum5/8","sum6/8","sum7/8; sum4=0; sum5=0; sum6=0; sum7=0}' ${tmpdir}/add_part_cols_4.txt > ${tmpdir}/add_part_cols_4_data.txt
+                  fi
+               fi
+               paste -d',' ${tmpdir}/add_part_cols_1_time.txt ${tmpdir}/add_part_cols_1_data.txt > ${tmpdir}/add_part_cols_1.new
+               mv -f ${tmpdir}/add_part_cols_1.new ${tmpdir}/add_part_cols_1.txt    
+               if [ ${interp} -eq 1 ]
+               then
+                  paste -d',' ${tmpdir}/add_part_cols_2_time.txt ${tmpdir}/add_part_cols_2_data.txt > ${tmpdir}/add_part_cols_2.new
+                  paste -d',' ${tmpdir}/add_part_cols_3_time.txt ${tmpdir}/add_part_cols_3_data.txt > ${tmpdir}/add_part_cols_3.new
+                  paste -d',' ${tmpdir}/add_part_cols_4_time.txt ${tmpdir}/add_part_cols_4_data.txt > ${tmpdir}/add_part_cols_4.new
+                  mv -f ${tmpdir}/add_part_cols_2.new ${tmpdir}/add_part_cols_2.txt
+                  mv -f ${tmpdir}/add_part_cols_3.new ${tmpdir}/add_part_cols_3.txt
+                  mv -f ${tmpdir}/add_part_cols_4.new ${tmpdir}/add_part_cols_4.txt
+               fi
+            fi         
+            # remove temporary files
+            rm -f add_part_cols_?_time.txt
+            rm -f add_part_cols_?_data.txt
+         fi   
+ 
+         # sum up the data columns
+         paste -d"," ${tmpdir}/part_cols_1.txt ${tmpdir}/add_part_cols_1.txt > ${tmpdir}/data_part_tmp_1.txt
+         if [ ${interp} -eq 1 ]
+         then
+            paste -d"," ${tmpdir}/part_cols_2.txt ${tmpdir}/add_part_cols_2.txt > ${tmpdir}/data_part_tmp_2.txt
+            paste -d"," ${tmpdir}/part_cols_3.txt ${tmpdir}/add_part_cols_3.txt > ${tmpdir}/data_part_tmp_3.txt
+            paste -d"," ${tmpdir}/part_cols_4.txt ${tmpdir}/add_part_cols_4.txt > ${tmpdir}/data_part_tmp_4.txt
+         fi
+        
+         if [ $nvars -eq 1 ]
+         then
+            awk -F "," '{print $1","$2","$3","$4+$8}' ${tmpdir}/data_part_tmp_1.txt > ${tmpdir}/part_cols_tmp_1.txt
+            if [ ${interp} -eq 1 ]
+            then
+               awk -F "," '{print $1","$2","$3","$4+$8}' ${tmpdir}/data_part_tmp_2.txt > ${tmpdir}/part_cols_tmp_2.txt
+               awk -F "," '{print $1","$2","$3","$4+$8}' ${tmpdir}/data_part_tmp_3.txt > ${tmpdir}/part_cols_tmp_3.txt
+               awk -F "," '{print $1","$2","$3","$4+$8}' ${tmpdir}/data_part_tmp_4.txt > ${tmpdir}/part_cols_tmp_4.txt
+            fi
+         elif [ $nvars -eq 2 ]
+         then
+            awk -F "," '{print $1","$2","$3","$4+$9","$5+$10}' ${tmpdir}/data_part_tmp_1.txt > ${tmpdir}/part_cols_tmp_1.txt
+            if [ ${interp} -eq 1 ]
+            then
+               awk -F "," '{print $1","$2","$3","$4+$9","$5+$10}' ${tmpdir}/data_part_tmp_2.txt > ${tmpdir}/part_cols_tmp_2.txt
+               awk -F "," '{print $1","$2","$3","$4+$9","$5+$10}' ${tmpdir}/data_part_tmp_3.txt > ${tmpdir}/part_cols_tmp_3.txt
+               awk -F "," '{print $1","$2","$3","$4+$9","$5+$10}' ${tmpdir}/data_part_tmp_4.txt > ${tmpdir}/part_cols_tmp_4.txt
+            fi
+         elif [ $nvars -eq 3 ]
+         then
+            awk -F "," '{print $1","$2","$3","$4+$10","$5+$11","$6+$12}' ${tmpdir}/data_part_tmp_1.txt > ${tmpdir}/part_cols_tmp_1.txt
+            if [ ${interp} -eq 1 ]
+            then
+               awk -F "," '{print $1","$2","$3","$4+$10","$5+$11","$6+$12}' ${tmpdir}/data_part_tmp_2.txt > ${tmpdir}/part_cols_tmp_2.txt
+               awk -F "," '{print $1","$2","$3","$4+$10","$5+$11","$6+$12}' ${tmpdir}/data_part_tmp_3.txt > ${tmpdir}/part_cols_tmp_3.txt
+               awk -F "," '{print $1","$2","$3","$4+$10","$5+$11","$6+$12}' ${tmpdir}/data_part_tmp_4.txt > ${tmpdir}/part_cols_tmp_4.txt
+            fi
+         elif [ $nvars -eq 4 ]
+         then
+            awk -F "," '{print $1","$2","$3","$4+$11","$5+$12","$6+$13","$7+$14}' ${tmpdir}/data_part_tmp_1.txt > ${tmpdir}/part_cols_tmp_1.txt
+            if [ ${interp} -eq 1 ]
+            then
+               awk -F "," '{print $1","$2","$3","$4+$11","$5+$12","$6+$13","$7+$14}' ${tmpdir}/data_part_tmp_2.txt > ${tmpdir}/part_cols_tmp_2.txt
+               awk -F "," '{print $1","$2","$3","$4+$11","$5+$12","$6+$13","$7+$14}' ${tmpdir}/data_part_tmp_3.txt > ${tmpdir}/part_cols_tmp_3.txt
+               awk -F "," '{print $1","$2","$3","$4+$11","$5+$12","$6+$13","$7+$14}' ${tmpdir}/data_part_tmp_4.txt > ${tmpdir}/part_cols_tmp_4.txt
+            fi
+         fi
+         
+         mv -f ${tmpdir}/part_cols_tmp_1.txt ${tmpdir}/part_cols_1.txt
+         if [ ${interp} -eq 1 ]
+         then
+            mv -f ${tmpdir}/part_cols_tmp_2.txt ${tmpdir}/part_cols_2.txt
+            mv -f ${tmpdir}/part_cols_tmp_3.txt ${tmpdir}/part_cols_3.txt
+            mv -f ${tmpdir}/part_cols_tmp_4.txt ${tmpdir}/part_cols_4.txt
+         fi
+         
+         # remove temporary files
+         rm -f ${tmpdir}/add_part_cols_?.txt
+         rm -f ${tmpdir}/data_part_tmp_?.txt
+         
+         idata=$((idata+1))
+      done   
+   
+      # cat back the header
+      cat ${tmpdir}/part_head.txt ${tmpdir}/part_cols_1.txt > ${tmpdir}/part_${ientry}_grid_1.txt   
+      if [ ${interp} -eq 1 ]
+      then
+         cat ${tmpdir}/part_head.txt ${tmpdir}/part_cols_2.txt > ${tmpdir}/part_${ientry}_grid_2.txt   
+         cat ${tmpdir}/part_head.txt ${tmpdir}/part_cols_3.txt > ${tmpdir}/part_${ientry}_grid_3.txt   
+         cat ${tmpdir}/part_head.txt ${tmpdir}/part_cols_4.txt > ${tmpdir}/part_${ientry}_grid_4.txt 
+      fi
+      
+      # remove temporary files
+      rm -f ${tmpdir}/part_head.txt
+      rm -f ${tmpdir}/part_cols_1.txt
+       
+      ientry=$((ientry+1))
+   done
+   
+   # concatenate the parts together ###########################################
+   ientry=0
+   while [ $ientry -lt ${#entrypath[@]} ]
+   do   
+      if [ $interp -eq 0 ]
+      then
+         mv -f  ${tmpdir}/part_${ientry}_grid_1.txt ${tmpdir}/part_${ientry}_station.txt
+      else  
+      # bilinear interpolation ---------------------------------------------
+         # extract header
+         head -n 1 ${tmpdir}/part_${ientry}_grid_1.txt > ${tmpdir}/station_head.txt
+         # extract time
+         awk -F "," 'NR>1 {print $1","$2","$3 }' ${tmpdir}/part_${ientry}_grid_1.txt > ${tmpdir}/station_time.txt
+         # number of variables
+         nvars=$(awk -F "," 'NR==2 { print NF }' ${tmpdir}/part_${ientry}_grid_1.txt) 
+         nvars=$(echo "${nvars}-3" | bc -l)
+         # extract variables values
+         if [ $nvars -eq 1 ]
+         then
+            awk -F "," 'NR>1 { print $4 }' ${tmpdir}/part_${ientry}_grid_1.txt > ${tmpdir}/grid_1_data.txt
+            awk -F "," 'NR>1 { print $4 }' ${tmpdir}/part_${ientry}_grid_2.txt > ${tmpdir}/grid_2_data.txt
+            awk -F "," 'NR>1 { print $4 }' ${tmpdir}/part_${ientry}_grid_3.txt > ${tmpdir}/grid_3_data.txt
+            awk -F "," 'NR>1 { print $4 }' ${tmpdir}/part_${ientry}_grid_4.txt > ${tmpdir}/grid_4_data.txt
+         elif [ $nvars -eq 2 ]
+         then
+            awk -F "," 'NR>1 { print $4,$5 }' ${tmpdir}/part_${ientry}_grid_1.txt > ${tmpdir}/grid_1_data.txt
+            awk -F "," 'NR>1 { print $4,$5 }' ${tmpdir}/part_${ientry}_grid_2.txt > ${tmpdir}/grid_2_data.txt
+            awk -F "," 'NR>1 { print $4,$5 }' ${tmpdir}/part_${ientry}_grid_3.txt > ${tmpdir}/grid_3_data.txt
+            awk -F "," 'NR>1 { print $4,$5 }' ${tmpdir}/part_${ientry}_grid_4.txt > ${tmpdir}/grid_4_data.txt
+         elif [ $nvars -eq 3 ]
+         then
+            awk -F "," 'NR>1 { print $4,$5,$6 }' ${tmpdir}/part_${ientry}_grid_1.txt > ${tmpdir}/grid_1_data.txt
+            awk -F "," 'NR>1 { print $4,$5,$6 }' ${tmpdir}/part_${ientry}_grid_2.txt > ${tmpdir}/grid_2_data.txt
+            awk -F "," 'NR>1 { print $4,$5,$6 }' ${tmpdir}/part_${ientry}_grid_3.txt > ${tmpdir}/grid_3_data.txt
+            awk -F "," 'NR>1 { print $4,$5,$6 }' ${tmpdir}/part_${ientry}_grid_4.txt > ${tmpdir}/grid_4_data.txt
+         elif [ $nvars -eq 4 ]
+         then
+            awk -F "," 'NR>1 { print $4,$5,$6,$7}' ${tmpdir}/part_${ientry}_grid_1.txt > ${tmpdir}/grid_1_data.txt
+            awk -F "," 'NR>1 { print $4,$5,$6,$7}' ${tmpdir}/part_${ientry}_grid_2.txt > ${tmpdir}/grid_2_data.txt
+            awk -F "," 'NR>1 { print $4,$5,$6,$7}' ${tmpdir}/part_${ientry}_grid_3.txt > ${tmpdir}/grid_3_data.txt
+            awk -F "," 'NR>1 { print $4,$5,$6,$7}' ${tmpdir}/part_${ientry}_grid_4.txt > ${tmpdir}/grid_4_data.txt 
+         fi   
+         paste -d" " ${tmpdir}/grid_1_data.txt ${tmpdir}/grid_2_data.txt ${tmpdir}/grid_3_data.txt ${tmpdir}/grid_4_data.txt > ${tmpdir}/grid_1234_data.txt
+        
+         # bilinear interpolation for every variable
+         if [ $nvars -eq 1 ]
+         then
+            awk -v x=$lonout -v y=$latout -v x1=$lon1 -v y1=$lat1 -v x2=$lon2 -v y2=$lat2 '{ printf "%+14.11f\n", 4*($1*(x2-x)*(y-y2)+$2*(x-x1)*(y-y2)+$3*(x2-x)*(y1-y)+$4*(x-x1)*(y1-y)) }' ${tmpdir}/grid_1234_data.txt > ${tmpdir}/station_data_1.txt
+         elif [ $nvars -eq 2 ]
+         then     
+            awk -v x=$lonout -v y=$latout -v x1=$lon1 -v y1=$lat1 -v x2=$lon2 -v y2=$lat2 '{ printf "%+14.11f\n", 4*($1*(x2-x)*(y-y2)+$3*(x-x1)*(y-y2)+$5*(x2-x)*(y1-y)+$7*(x-x1)*(y1-y)) }' ${tmpdir}/grid_1234_data.txt > ${tmpdir}/station_data_1.txt
+            awk -v x=$lonout -v y=$latout -v x1=$lon1 -v y1=$lat1 -v x2=$lon2 -v y2=$lat2 '{ printf "%+14.11f\n", 4*($2*(x2-x)*(y-y2)+$4*(x-x1)*(y-y2)+$6*(x2-x)*(y1-y)+$8*(x-x1)*(y1-y)) }' ${tmpdir}/grid_1234_data.txt > ${tmpdir}/station_data_2.txt
+         elif [ $nvars -eq 3 ]
+         then
+            awk -v x=$lonout -v y=$latout -v x1=$lon1 -v y1=$lat1 -v x2=$lon2 -v y2=$lat2 '{ printf "%+14.11f\n", 4*($1*(x2-x)*(y-y2)+$4*(x-x1)*(y-y2)+$7*(x2-x)*(y1-y)+$10*(x-x1)*(y1-y)) }' ${tmpdir}/grid_1234_data.txt > ${tmpdir}/station_data_1.txt
+            awk -v x=$lonout -v y=$latout -v x1=$lon1 -v y1=$lat1 -v x2=$lon2 -v y2=$lat2 '{ printf "%+14.11f\n", 4*($2*(x2-x)*(y-y2)+$5*(x-x1)*(y-y2)+$8*(x2-x)*(y1-y)+$11*(x-x1)*(y1-y)) }' ${tmpdir}/grid_1234_data.txt > ${tmpdir}/station_data_2.txt
+            awk -v x=$lonout -v y=$latout -v x1=$lon1 -v y1=$lat1 -v x2=$lon2 -v y2=$lat2 '{ printf "%+14.11f\n", 4*($3*(x2-x)*(y-y2)+$6*(x-x1)*(y-y2)+$9*(x2-x)*(y1-y)+$12*(x-x1)*(y1-y)) }' ${tmpdir}/grid_1234_data.txt > ${tmpdir}/station_data_3.txt
+         elif [ $nvars -eq 4 ]
+         then 
+            awk -v x=$lonout -v y=$latout -v x1=$lon1 -v y1=$lat1 -v x2=$lon2 -v y2=$lat2 '{ printf "%+14.11f\n", 4*($1*(x2-x)*(y-y2)+$5*(x-x1)*(y-y2)+$9*(x2-x)*(y1-y)+$13*(x-x1)*(y1-y)) }' ${tmpdir}/grid_1234_data.txt > ${tmpdir}/station_data_1.txt
+            awk -v x=$lonout -v y=$latout -v x1=$lon1 -v y1=$lat1 -v x2=$lon2 -v y2=$lat2 '{ printf "%+14.11f\n", 4*($2*(x2-x)*(y-y2)+$6*(x-x1)*(y-y2)+$10*(x2-x)*(y1-y)+$14*(x-x1)*(y1-y)) }' ${tmpdir}/grid_1234_data.txt > ${tmpdir}/station_data_2.txt
+            awk -v x=$lonout -v y=$latout -v x1=$lon1 -v y1=$lat1 -v x2=$lon2 -v y2=$lat2 '{ printf "%+14.11f\n", 4*($3*(x2-x)*(y-y2)+$7*(x-x1)*(y-y2)+$11*(x2-x)*(y1-y)+$15*(x-x1)*(y1-y)) }' ${tmpdir}/grid_1234_data.txt > ${tmpdir}/station_data_3.txt
+            awk -v x=$lonout -v y=$latout -v x1=$lon1 -v y1=$lat1 -v x2=$lon2 -v y2=$lat2 '{ printf "%+14.11f\n", 4*($4*(x2-x)*(y-y2)+$8*(x-x1)*(y-y2)+$12*(x2-x)*(y1-y)+$16*(x-x1)*(y1-y)) }' ${tmpdir}/grid_1234_data.txt > ${tmpdir}/station_data_4.txt
+         fi
+      
+         # bring the results together
+         paste -d',' ${tmpdir}/station_time.txt ${tmpdir}/station_data_?.txt > ${tmpdir}/station_tmp.txt
+         cat ${tmpdir}/station_head.txt ${tmpdir}/station_tmp.txt > ${tmpdir}/part_${ientry}_station.txt
+   
+         # remove temporary files
+         rm -f ${tmpdir}/station_head.txt
+         rm -f ${tmpdir}/station_time.txt
+         rm -f ${tmpdir}/part_${ientry}_grid_?.txt
+         rm -f ${tmpdir}/grid*_data.txt
+         rm -f ${tmpdir}/station_data_?.txt
+         rm -f ${tmpdir}/station_tmp.txt
+      fi   
+  
+      # append ----------------------------------------------------------------
+      if [ -r ${tmpdir}/station.txt ]
+      then	  
+         mv -f ${tmpdir}/station.txt ${tmpdir}/station_tmp.txt
+         sed '1d' ${tmpdir}/part_${ientry}_station.txt > ${tmpdir}/station_part_tmp.txt
+         cat ${tmpdir}/station_tmp.txt ${tmpdir}/station_part_tmp.txt > ${tmpdir}/station.txt    
+         rm -f ${tmpdir}/station_tmp.txt
+         rm -f ${tmpdir}/station_part_tmp.txt
+      else      
+         mv -f ${tmpdir}/part_${ientry}_station.txt ${tmpdir}/station.txt
+      fi
+      rm -f ${tmpdir}/part_${ientry}_station.txt
+ 
+      ientry=$((ientry+1))
+   done   
+    
+   # remove columns latitude and longitude -----------------------------------
+   cut -d, -f-1,4- ${tmpdir}/station.txt > ${tmpdir}/station_new.txt
+ 
+   # add header --------------------------------------------------------------
+   echo "# Station: ${station[$istation]}   (lat: ${lat[$istation]} / lon: ${lon[$istation]})" > ${tmpdir}/header.txt
+   if [ $interp -eq 0 ]
+   then
+      echo "#                     at gridpoint (lat: ${lat0} / lon: ${lon0})" >> ${tmpdir}/header.txt
+   else
+      echo "#"                                                                >> ${tmpdir}/header.txt
+   fi
+   cat ${tmpdir}/header.txt ${tmpdir}/station_new.txt > ${tmpdir}/station.csv
+   # insert unit information
+   sed 's/unit=""/unit="m"/g' ${tmpdir}/station.csv > ${outfile}
+ 
+   # remove temporary files
+   rm -f ${tmpdir}/station.txt
+   rm -f ${tmpdir}/header.txt
+   rm -f ${tmpdir}/station_new.txt
+   rm -f ${tmpdir}/station.csv
+   
+   istation=$((istation+1))
+done
+# end loop over all stations ##################################################
+###############################################################################
+
+# remove scratch directory
+if [[ $deletetmpdir = "yes" ]]
+then
+   rm -rf $tmpdir
+fi   
+
+exit

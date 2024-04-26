@@ -25,14 +25,16 @@ J. Geophys. Res. Solid earth 118, doi:10.1002/jgrb.50353.
 Note: As of April 2024, this script doesn't seem to work.
 Maybe the interface of the GFZ script has changed since I wrote this.
 Needs to be de-bugged.
-"""
 
+CH comments: 
+"""
+# %%
 import subprocess
 import datetime as dt
 
 
 def get_stations(input_file, product, output_dir, log_file):
-    """ Function to download a bunch of LSDM loading products from the GFZ website! """
+    """ Function to download loading products from the GFZ website! """
     ifile = open(input_file, 'r')
     ofile = open(log_file, 'w')
     ofile.close()  # just to start the log file
@@ -43,9 +45,9 @@ def get_stations(input_file, product, output_dir, log_file):
             continue
         station_name, lon, lat = temp[0], temp[1], temp[2]
         start_date, end_date = dt.datetime.strptime(temp[3], "%Y-%m-%d"), dt.datetime.strptime(temp[4], '%Y-%m-%d')
-        file_destination = output_dir + station_name+"_LSDM_hydro"  # .txt extension will be added automatically
+        file_destination = output_dir + station_name+product  # .txt extension will be added automatically
 
-        print("Getting LSDM Hydro for station %s " % station_name)
+        print("Getting "+ product + "for station %s " % station_name)
         print("./extractlatlon_bilinintp_remote "+product+" CF "+dt.datetime.strftime(start_date, "%Y-%m-%d")+" " +
               dt.datetime.strftime(end_date, "%Y-%m-%d")+" "+lat+" "+lon+" -o " +
               file_destination)
@@ -57,9 +59,11 @@ def get_stations(input_file, product, output_dir, log_file):
     ifile.close()
     return
 
-
+# %%
 if __name__ == "__main__":
-    my_input_file = "CA_OR.txt"  # set your input file with station specs
-    my_output_dir = "../LSDM/"  # set where you want to put your LSDM loads.  Should end with '/'.
-    product_name = "HYDL"  # OPTIONS: HYDL, NTAL, NTOL+NTAL, etc.
+    my_input_file = "coordinates.txt"  # set your input file with station specs
+    my_output_dir = "C:/Users/carol/Box Sync/Shapefiles_06Seasonal/NTAL_NTOL_ESMGFZ/"  # set where you want to put your LSDM loads.  Should end with '/'.
+    product_name = "NTAL+NTOL"  # OPTIONS: HYDL, NTAL, NTOL+NTAL, etc.
     get_stations(my_input_file, product_name, my_output_dir, log_file='log.txt')
+
+# %%
